@@ -15,6 +15,13 @@ This tool acts as an **Automated Oral Exam**, shifting assessment from black-box
 
 If a student struggles, the system provides scaffolded hints rather than revealing the solution.
 
+## Demo
+
+
+https://github.com/user-attachments/assets/78150378-7d81-4d7f-abde-065ea45b6816
+
+
+
 ## Quick Start
 
 **1. Clone and Install**
