@@ -3,6 +3,9 @@ import json
 import os
 import time
 import random
+import sys
+import re
+from types import SimpleNamespace
 
 try:
     import google.generativeai as genai
@@ -10,6 +13,20 @@ try:
     GEMINI_AVAILABLE = True
 except ImportError:
     GEMINI_AVAILABLE = False
+
+try:
+    # llama_cpp may be used with llama-cpp-python if available
+    import llama_cpp  # noqa: F401
+    LLAMA_CPP_AVAILABLE = True
+except Exception:
+    LLAMA_CPP_AVAILABLE = False
+
+try:
+    from huggingface_hub import InferenceClient
+    HF_HUB_AVAILABLE = True
+except ImportError:
+    InferenceClient = None
+    HF_HUB_AVAILABLE = False
 
 st.set_page_config(page_title="APAS Chatbot Framework Demo", layout="wide")
 
@@ -162,6 +179,118 @@ def init_gemini():
     return None
 
 
+# --- Model Initialization --------------------------------------------------
+@st.cache_resource(show_spinner=False)
+def init_model(backend_choice, gemini_key=None, hf_token=None):
+    """Initialize an available model backend.
+
+    Priority & options:
+    - If user selects Gemini and GEMINI_AVAILABLE with API key, use Gemini.
+    - If user selects Hugging Face API, use InferenceClient (remote).
+    - Else if local transformer model is requested/available, use HF pipeline.
+    - Else return None to force fallback logic already present in the app.
+    """
+    # Helper wrappers to unify API
+    class GeminiWrapper:
+        def __init__(self, genai_model):
+            self._m = genai_model
+
+        def generate_content(self, prompt: str):
+            return self._m.generate_content(prompt)
+
+    class HFAPIWrapper:
+        def __init__(self, client, model_name):
+            self._client = client
+            self._model = model_name
+
+        def generate_content(self, prompt: str):
+            # Try chat completion first (better for instruction following models)
+            try:
+                messages = [{"role": "user", "content": prompt}]
+                response = self._client.chat_completion(
+                    messages=messages,
+                    model=self._model,
+                    max_tokens=1024,
+                    temperature=0.7
+                )
+                text = response.choices[0].message.content
+            except Exception as e:
+                # Fallback to simple text generation
+                try:
+                    text = self._client.text_generation(
+                        prompt,
+                        model=self._model,
+                        max_new_tokens=1024,
+                        temperature=0.7
+                    )
+                except Exception as e2:
+                    st.error(f"HF API Error: {e}. Fallback Error: {e2}")
+                    text = ""
+            return SimpleNamespace(text=text)
+
+    class HFWrapper:
+        def __init__(self, model_name):
+            from transformers import pipeline
+            self._pipe = pipeline("text-generation", model=model_name, max_length=150, num_return_sequences=1)
+
+        def generate_content(self, prompt: str):
+            result = self._pipe(prompt)
+            return SimpleNamespace(text=result[0]["generated_text"])
+
+    # Try explicit choices first
+    if backend_choice == "None (Fallback)":
+        return None
+
+    # 1. Gemini
+    if backend_choice in ("Auto (Gemini -> HF API -> Local)", "Gemini"):
+        if GEMINI_AVAILABLE:
+            api_key = gemini_key or os.environ.get("GEMINI_API_KEY") or st.secrets.get("GEMINI_API_KEY", "")
+            if api_key:
+                try:
+                    genai.configure(api_key=api_key)
+                    gm = genai.GenerativeModel("gemini-2.0-flash")
+                    return GeminiWrapper(gm)
+                except Exception:
+                    if backend_choice == "Gemini":
+                        return None
+        elif backend_choice == "Gemini":
+            return None
+
+    # 2. Hugging Face API (Remote, Free Tier)
+    if backend_choice in ("Auto (Gemini -> HF API -> Local)", "Hugging Face API"):
+        if HF_HUB_AVAILABLE:
+            # Get token from env or secrets (optional for some models, but recommended)
+            token = hf_token or os.environ.get("HF_TOKEN") or st.secrets.get("HF_TOKEN") or st.secrets.get("HUGGINGFACE_API_KEY", "")
+            # Default to a good instruction tuned model
+            # User requested Gemma. Note: Gemma is gated, ensure you have accepted terms on HF website.
+            hf_model = os.environ.get("HF_MODEL") or st.secrets.get("HF_MODEL", "google/gemma-2-9b-it")
+
+            try:
+                client = InferenceClient(token=token if token else None)
+                # Test connection lightly? No, just return wrapper.
+                return HFAPIWrapper(client, hf_model)
+            except Exception:
+                if backend_choice == "Hugging Face API":
+                    return None
+
+    # If auto or explicit local requested, try transformers
+    if backend_choice in ("Auto (Gemini -> HF API -> Local)", "Local (transformers)"):
+        if LLAMA_CPP_AVAILABLE and "llama-cpp-python" in sys.modules:
+            # Prefer llama_cpp if available (faster, lower memory)
+            model_name = os.environ.get("LLAMA_MODEL", "TheBloke/vicuna-7B-1.1-HF")
+            return HFWrapper(model_name)
+
+        try:
+            from transformers import pipeline
+            model_name = os.environ.get("HF_MODEL", "gpt2")
+            pipe = pipeline("text-generation", model=model_name, max_length=150, num_return_sequences=1)
+            return HFWrapper(pipe)
+        except Exception:
+            return None
+
+    return None
+
+
 def retry_api_call(func, max_retries=3, initial_delay=2):
     """Retry wrapper with exponential backoff for rate limiting errors."""
     for attempt in range(max_retries):
@@ -186,6 +315,13 @@ def retry_api_call(func, max_retries=3, initial_delay=2):
 def parse_json_response(response_text: str):
     """Normalize Gemini output into JSON."""
     text = (response_text or "").strip()
+
+    # Attempt to find JSON structure via regex if direct parse fails
+    # This helps with chatty models (like Mistral) that add conversational filler
+    json_match = re.search(r"\{.*\}", text, re.DOTALL)
+    if json_match:
+        text = json_match.group(0)
+
     if text.startswith("```json"):
         text = text[7:]
     if text.startswith("```"):
@@ -195,6 +331,8 @@ def parse_json_response(response_text: str):
     try:
         return json.loads(text.strip())
     except json.JSONDecodeError:
+        if text:
+            st.warning(f"⚠️ AI Response was not valid JSON. Raw output:\n{text}")
         return None
 
 
@@ -207,7 +345,10 @@ def gemini_call(prompt: str, model):
         return parse_json_response(response.text)
 
     try:
-        return retry_api_call(_invoke)
+        result = retry_api_call(_invoke)
+        if result:
+            result["_source"] = "AI Model"  # Mark as AI generated
+        return result
     except Exception:
         return None
 
@@ -269,21 +410,26 @@ Output JSON: {{ "similarity_score": <0-100>, "feedback": "...", "hint": "..." }}
 
     # Fallback Grading Logic (Keyword Matching)
     keywords = get_fallback_data(st.session_state.current_iteration, "keywords")
+    result = {}
+
     if not keywords:
         # Simple length check if no keywords defined
         score = 80 if len(student_answer) > 20 else 40
-        return {"similarity_score": score, "feedback": "Evaluation based on length (Fallback).", "hint": ""}
-
-    hits = sum(1 for word in keywords if word.lower() in student_answer.lower())
-
-    if hits >= 2:
-        return {"similarity_score": 90, "feedback": "Great job! You hit the key concepts.", "hint": ""}
-    elif hits == 1:
-        return {"similarity_score": 60, "feedback": "You're on the right track, but missed some details.",
-                "hint": f"Consider using terms like {random.choice(keywords)}."}
+        result = {"similarity_score": score, "feedback": "Evaluation based on length (Fallback).", "hint": ""}
     else:
-        return {"similarity_score": 30, "feedback": "That doesn't seem to match the core concept.",
-                "hint": "Think about the underlying memory or logic mechanics."}
+        hits = sum(1 for word in keywords if word.lower() in student_answer.lower())
+
+        if hits >= 2:
+            result = {"similarity_score": 90, "feedback": "Great job! You hit the key concepts.", "hint": ""}
+        elif hits == 1:
+            result = {"similarity_score": 60, "feedback": "You're on the right track, but missed some details.",
+                    "hint": f"Consider using terms like {random.choice(keywords)}."}
+        else:
+            result = {"similarity_score": 30, "feedback": "That doesn't seem to match the core concept.",
+                    "hint": "Think about the underlying memory or logic mechanics."}
+
+    result["_source"] = "Fallback Logic"
+    return result
 
 
 # --- Demo data --------------------------------------------------------------
@@ -329,10 +475,31 @@ def bootstrap_state():
 
 
 bootstrap_state()
-model = init_gemini()
 
 # --- Sidebar ----------------------------------------------------------------
 st.sidebar.title("Configuration")
+
+backend_choice = st.sidebar.selectbox(
+    "Model Backend",
+    ("Auto (Gemini -> HF API -> Local)", "Gemini", "Hugging Face API", "Local (transformers)", "None (Fallback)"),
+    index=0,
+    help="Choose which model backend to use. 'Hugging Face API' runs remotely (free tier available).",
+)
+
+# Get or prompt for API keys if Gemini or HF API is selected
+gemini_key = None
+hf_token = None
+
+if backend_choice == "Gemini" or backend_choice == "Auto (Gemini -> HF API -> Local)":
+    default_gemini = os.environ.get("GEMINI_API_KEY") or st.secrets.get("GEMINI_API_KEY", "")
+    gemini_key = st.sidebar.text_input("Gemini API Key", type="password", value=default_gemini, help="Required for Gemini model.")
+
+if backend_choice == "Hugging Face API" or backend_choice == "Auto (Gemini -> HF API -> Local)":
+    default_hf = os.environ.get("HF_TOKEN") or st.secrets.get("HF_TOKEN") or st.secrets.get("HUGGINGFACE_API_KEY", "")
+    hf_token = st.sidebar.text_input("Hugging Face Token", type="password", value=default_hf, help="Optional: Token for Hugging Face Inference API.")
+
+model = init_model(backend_choice, gemini_key, hf_token)
+
 new_demo_mode = st.sidebar.checkbox(
     "Demo Mode",
     value=st.session_state.demo_mode,
@@ -442,7 +609,7 @@ else:
     if st.session_state.tier1_correct:
         st.success("✅ Perfect selection! Every correct option was chosen and no incorrect options were selected.")
     else:
-        st.error(f"❌ Not quite. The correct answer was: {', '.join([mcq['options'][i] for i in correct_indices])}")
+        st.error("❌ Not quite. Please review the code logic and try again.")
 
     if st.button("Try Tier 1 Again"):
         st.session_state.tier1_done = False
@@ -517,6 +684,13 @@ if st.session_state.tier1_done and st.session_state.tier1_correct:
         tier2_score = result["similarity_score"] * 0.8
         total_score = tier1_score + tier2_score
         iteration_state["score"] = total_score
+
+        # Display Source Indicator
+        source = result.get("_source", "Unknown")
+        if source == "Fallback Logic":
+            st.caption("⚠️ Graded using **Fallback Logic** (Model unavailable or failed to respond correctly).")
+        else:
+            st.caption(f"🤖 Graded by **{source}**")
 
         c1, c2, c3 = st.columns(3)
         c1.metric("Tier 1", f"{tier1_score}/20")
